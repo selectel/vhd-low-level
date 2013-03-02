@@ -1,0 +1,148 @@
+#!/usr/bin/python
+
+#    (c) Selectel, 2013
+#    by George Shuklin
+#
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+'''
+    validate VHD file for validity and allows to predict percentage of recovery
+'''
+
+import sys, os
+import argparse
+import struct
+
+VERSION = 'vhd-validate 1.0'
+
+class P():
+    def __init__(self,visible):
+        self.visible=visible
+
+    def __call__(self, message=""):
+        if self.visible:
+                print message
+
+def overlap(a, b): #http://stackoverflow.com/questions/2953967/built-in-function-for-computing-overlap-in-python
+    return max(0, min(a[1], b[1]) - max(a[0], b[0]))
+
+
+def block_overlap(block_list,block_start,block_size):
+    '''
+        return overlapping if block_start+block_size overlap with any value in block_list (+block_size) or return False
+    '''
+    for b in block_list:
+        if overlap((b,b+block_size), (block_start,block_start+block_size)):
+            return b
+    return False
+
+def vhd_bat_validate(fd,stat,offset,entries,debug,verbose):
+    '''
+        return table of valid bat entries
+    '''
+    beyond_count=0
+    duplicate_count=0
+    overlap_count=0
+    empty_count=0
+    block_list=set()
+    for e in xrange(1,entries):
+        os.lseek(fd,offset+(e-1)*4,os.SEEK_SET)
+        block_start=struct.unpack("!I",os.read(fd,4))[0]
+        if block_start==0xFFFFFFFF: #empty block
+            debug("[NOOP] block %i is empty"%(block_start))
+            empty_count+=1
+        elif block_start*512>stat.st_size:
+            print "[GONE] block %i points to sector %i (offset=%i). It is completely beyond file end (%i). BAT is corrupted or file trunkated."%(e,block_start,block_start*512,stat.st_size)
+            beyond_count+=1
+        elif (block_start+4096+8)*512 >stat.st_size: #4096 sectors - default block size, 8 sectors - some padding at the block start (ask Citrix why)
+            print "[BAD ] block %i poinst to sector %i (offset=%i) with block size %i. It partially beyond file end (%i). BAT is corrupted or file trunkated."%(e,block_start,block_start*512,(4096+8)*512,stat.st_size)
+            beyond_count+=1
+        elif block_start in block_list:
+            print "[BAD ] block %i is duplicate, pointing to %i"%(e,block_start)
+            duplicate_count+=1;
+        elif block_overlap(block_list,block_start,(4096+8)): #note, blocks are checking with sector_count, not bytes (no '*512')
+            print "[BAD ] block %i is overlapping with other region ponting to %i, overlapping with %i pointed by previos BAT entry"%(e,block_start,block_overlap(block_list,block_start,(4096+8)))
+        else:
+            block_list.add(block_start);
+            debug("[good] block %i points to sector %i (offset=%i) with block size %i. It is within file borders."%(e,block_start,block_start*512,(4096+8)*512))
+    if beyond_count or duplicate_count or overlap_count:
+            print "\nBlock Allocation Table (BAT) containts ERRORS!"
+    else:
+        verbose("\nBAT is fine")
+    verbose("Statistic:")
+    verbose("Total blocks:\t%i"%entries)
+    verbose("Empty blocks:\t%i"%empty_count)
+    verbose("Beyond count:\t%i"%beyond_count)
+    verbose("Duplicates:\t%i"%duplicate_count)
+    verbose("Overlappings:\t%i"%overlap_count)
+    return block_list
+
+def vhd_process(vhd,bat,mte,batsize,debug,verbose):
+    debug=P(debug)
+    verbose=P(verbose)
+    stat=os.stat(vhd)
+    debug("stats for %s is %s" %(vhd,str(stat)))
+    if not batsize:
+        if stat.st_size<mte:
+                print "MTE (%i) is beyond file end (size=%i)"%(mte,stat.st_size)
+                return
+        fd=os.open(vhd,os.O_RDONLY|os.O_NONBLOCK)
+        debug("file %s opened as fd %i"%(vhd,fd))
+        os.lseek(fd,mte,os.SEEK_SET)
+        entries=struct.unpack("!I",os.read(fd,4))[0]
+        verbose("Got MTE value from offset %x: %i"%(mte,entries))
+        verbose("assuming block size to 2MiB, payload (disk size) is %i=%iMiB"%(entries*2*1024*1024, entries*2))
+    else:
+        entries=batsize
+        verbose("BAT size forced to %i, ignoring value in the VHD file.  Blocksize is 2MiB, payload is %i (%iMiB)"%(entries,entries*2*1024*1024,entries*2))
+    if entries > 8388607: #(max_uint4/512-1)
+        print "MTE (%i) is larger than BAT can holds (%i): or MTE is wrong, or BAT contains duplicate entries, but will continue the check..."%(entries,8388607)
+    if stat.st_size < bat:
+        print "BAT is completely beyond file end (expected placement: %i, file size: %i). Nothing to do, exiting"%(bat,stat.st_size)
+        return
+    if stat.st_size < bat+entries*4: # 4 - size of each entry in BAT
+        print "BAT is partially beyond file end (BAT offset is %i, BAT size is %i, file size %i), but will continue to validate leftovers."%(bat,entries*4,stat.st_size)
+    debug('Stage 1 validation: check all BAT entries are in file and not overlapping')
+    vhd_bat_validate(fd,stat,bat,entries,debug,verbose)
+    os.close(fd)
+    
+
+def main():
+    parser=argparse.ArgumentParser()
+    parser.add_argument("vhd_file", help="Path to VHD file, f.e. ~/d5f498d7-6e15-4c39-98d2-4d0c42cc6d3d.vhd")
+    parser.add_argument("-v", "--verbosity", help="increase output verbosity", action="store_true")
+    parser.add_argument("-d", "--debug", help="put junk on screen", action="store_true")
+    parser.add_argument("--bat", help="change default (0x600) BAT location, in hex", default="0x600")
+    parser.add_argument("--mte", help="change default MTE field location, in hex", default="0x21C")
+    parser.add_argument("--batsize", help="force  BAT size (override MTE filed in Dynamic Header), count in entries, hex", default='0')
+    args = parser.parse_args() 
+    try:
+        bat=int(args.bat,base=16)
+    except:
+        print "Bad offset format (%s), expecting hex (0x600)\n"%(args.offset)
+        sys.exit(-1)
+
+    try:
+        mte=int(args.mte,base=16)
+    except:
+        print "Bat MTE format (%s), expecting hex (0x21C)\n"%(args.mte)
+        sys.exit(-1)
+    try:
+        batsize=int(args.batsize,base=16)
+    except:
+        print "Bat batsize format (%s), expecting hex (f.e. 0x1FF)\n"%(args.batsize)
+    vhd_process(args.vhd_file, bat,mte,batsize,args.debug, args.verbosity)
+
+if __name__ == "__main__":
+    main()
