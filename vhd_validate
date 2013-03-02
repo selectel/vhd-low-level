@@ -55,18 +55,23 @@ def vhd_bat_validate(fd,stat,offset,entries,debug,verbose):
     duplicate_count=0
     overlap_count=0
     empty_count=0
+    error_count=0
     block_list=set()
     for e in xrange(1,entries):
         os.lseek(fd,offset+(e-1)*4,os.SEEK_SET)
-        block_start=struct.unpack("!I",os.read(fd,4))[0]
+        try:
+            block_start=struct.unpack("!I",os.read(fd,4))[0]
+        except:
+            print "failed to read entry %i from offset %i"%(e,offset+(e-1)*4)
+            error_count+=1
         if block_start==0xFFFFFFFF: #empty block
             debug("[NOOP] block %i is empty"%(block_start))
             empty_count+=1
         elif block_start*512>stat.st_size:
-            print "[GONE] block %i points to sector %i (offset=%i). It is completely beyond file end (%i). BAT is corrupted or file trunkated."%(e,block_start,block_start*512,stat.st_size)
+            print "[GONE] block %i points to sector %i (block offset in file %i). It is completely beyond file end (%i). BAT is corrupted or file truncated."%(e,block_start,block_start*512,stat.st_size)
             beyond_count+=1
         elif (block_start+4096+8)*512 >stat.st_size: #4096 sectors - default block size, 8 sectors - some padding at the block start (ask Citrix why)
-            print "[BAD ] block %i poinst to sector %i (offset=%i) with block size %i. It partially beyond file end (%i). BAT is corrupted or file trunkated."%(e,block_start,block_start*512,(4096+8)*512,stat.st_size)
+            print "[BAD ] block %i poinst to sector %i (block offset in file %i) with block size %i. It partially beyond file end (%i). BAT is corrupted or file truncated. If VHD footer is present, block missing %i bytes"%(e,block_start,block_start*512,(4096+8)*512,stat.st_size,(block_start+4096+8+1)*512-stat.st_size) #+1 - VHD footer
             beyond_count+=1
         elif block_start in block_list:
             print "[BAD ] block %i is duplicate, pointing to %i"%(e,block_start)
@@ -76,23 +81,26 @@ def vhd_bat_validate(fd,stat,offset,entries,debug,verbose):
         else:
             block_list.add(block_start);
             debug("[good] block %i points to sector %i (offset=%i) with block size %i. It is within file borders."%(e,block_start,block_start*512,(4096+8)*512))
-    if beyond_count or duplicate_count or overlap_count:
-            print "\nBlock Allocation Table (BAT) containts ERRORS!"
+    if beyond_count or duplicate_count or overlap_count or error_count:
+            print "\nBlock Allocation Table (BAT) contains ERRORS!"
     else:
         verbose("\nBAT is fine")
     verbose("Statistic:")
     verbose("Total blocks:\t%i"%entries)
+    verbose("Error read BAT:\t%i"%error_count)
     verbose("Empty blocks:\t%i"%empty_count)
-    verbose("Beyond count:\t%i"%beyond_count)
+    verbose("Beyond file:\t%i"%beyond_count)
     verbose("Duplicates:\t%i"%duplicate_count)
     verbose("Overlappings:\t%i"%overlap_count)
     return block_list
 
-def vhd_process(vhd,bat,mte,batsize,debug,verbose):
+def vhd_process(vhd,bat,mte,batsize,full,debug,verbose):
     debug=P(debug)
     verbose=P(verbose)
     stat=os.stat(vhd)
     debug("stats for %s is %s" %(vhd,str(stat)))
+    if full:
+        pass
     if not batsize:
         if stat.st_size<mte:
                 print "MTE (%i) is beyond file end (size=%i)"%(mte,stat.st_size)
@@ -101,11 +109,11 @@ def vhd_process(vhd,bat,mte,batsize,debug,verbose):
         debug("file %s opened as fd %i"%(vhd,fd))
         os.lseek(fd,mte,os.SEEK_SET)
         entries=struct.unpack("!I",os.read(fd,4))[0]
-        verbose("Got MTE value from offset %x: %i"%(mte,entries))
-        verbose("assuming block size to 2MiB, payload (disk size) is %i=%iMiB"%(entries*2*1024*1024, entries*2))
+        debug("Got MTE value from offset %x: %i"%(mte,entries))
+        debug("assuming block size to 2MiB, payload (disk size) is %i=%iMiB"%(entries*2*1024*1024, entries*2))
     else:
         entries=batsize
-        verbose("BAT size forced to %i, ignoring value in the VHD file.  Blocksize is 2MiB, payload is %i (%iMiB)"%(entries,entries*2*1024*1024,entries*2))
+        debug("BAT size forced to %i, ignoring value in the VHD file.  Blocksize is 2MiB, payload is %i (%iMiB)"%(entries,entries*2*1024*1024,entries*2))
     if entries > 8388607: #(max_uint4/512-1)
         print "MTE (%i) is larger than BAT can holds (%i): or MTE is wrong, or BAT contains duplicate entries, but will continue the check..."%(entries,8388607)
     if stat.st_size < bat:
@@ -123,6 +131,7 @@ def main():
     parser.add_argument("vhd_file", help="Path to VHD file, f.e. ~/d5f498d7-6e15-4c39-98d2-4d0c42cc6d3d.vhd")
     parser.add_argument("-v", "--verbosity", help="increase output verbosity", action="store_true")
     parser.add_argument("-d", "--debug", help="put junk on screen", action="store_true")
+    parser.add_argument("--full", help="perform full validation (even useless fields)", action="store_true") #not ipmlemented yet
     parser.add_argument("--bat", help="change default (0x600) BAT location, in hex", default="0x600")
     parser.add_argument("--mte", help="change default MTE field location, in hex", default="0x21C")
     parser.add_argument("--batsize", help="force  BAT size (override MTE filed in Dynamic Header), count in entries, hex", default='0')
@@ -142,7 +151,7 @@ def main():
         batsize=int(args.batsize,base=16)
     except:
         print "Bat batsize format (%s), expecting hex (f.e. 0x1FF)\n"%(args.batsize)
-    vhd_process(args.vhd_file, bat,mte,batsize,args.debug, args.verbosity)
+    vhd_process(args.vhd_file, bat,mte,batsize,args.full,args.debug, args.verbosity)
 
 if __name__ == "__main__":
     main()
