@@ -17,7 +17,7 @@
 #    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 '''
-    validate VHD file for validity and allows to predict percentage of recovery
+    validates VHD Block Allocation Table and reports bad blocks
 '''
 
 import sys, os
@@ -56,36 +56,38 @@ def vhd_bat_validate(fd,stat,offset,entries,debug,verbose):
     overlap_count=0
     empty_count=0
     error_count=0
-    block_list=set()
-    for e in xrange(1,entries):
-        os.lseek(fd,offset+(e-1)*4,os.SEEK_SET)
+    block_list=list()
+    for e in xrange(0,entries):
+        os.lseek(fd,offset+e*4,os.SEEK_SET)
         try:
             block_start=struct.unpack("!I",os.read(fd,4))[0]
         except:
-            print "failed to read entry %i from offset %i"%(e,offset+(e-1)*4)
+            print "failed to read entry %i from offset %i"%(e,offset+e*4)
             error_count+=1
         if block_start==0xFFFFFFFF: #empty block
-            debug("[NOOP] block %i is empty"%(block_start))
+            debug("[NOOP] entry %i is empty"%(block_start))
             empty_count+=1
         elif block_start*512>stat.st_size:
-            print "[GONE] block %i points to sector %i (block offset in file %i). It is completely beyond file end (%i). BAT is corrupted or file truncated."%(e,block_start,block_start*512,stat.st_size)
+            print "[GONE] entry %i points to sector %i (block offset in file %i). It is completely beyond file end (%i). BAT is corrupted or file truncated."%(e,block_start,block_start*512,stat.st_size)
             beyond_count+=1
-        elif (block_start+4096+8)*512 >stat.st_size: #4096 sectors - default block size, 8 sectors - some padding at the block start (ask Citrix why)
-            print "[BAD ] block %i poinst to sector %i (block offset in file %i) with block size %i. It partially beyond file end (%i). BAT is corrupted or file truncated. If VHD footer is present, block missing %i bytes"%(e,block_start,block_start*512,(4096+8)*512,stat.st_size,(block_start+4096+8+1)*512-stat.st_size) #+1 - VHD footer
+        elif (block_start+4096+1)*512 >stat.st_size: #4096 sectors - default block size, 1 sector - bitmap
+            print "[BAD ] entry %i poinst to sector %i (block offset in file %i) with block size %i. It partially beyond file end (%i). BAT is corrupted or file truncated. If VHD footer is present, block missing %i bytes"%(e,block_start,block_start*512,(4096+1)*512,stat.st_size,(block_start+4096+1)*512-stat.st_size) #+1 - VHD footer
             beyond_count+=1
+        elif (block_start+4096+2)*512 >stat.st_size: #VHD has footer (512 bytes) - if that footer is missing, file is somehow damaged
+            print "[WARN] entry %i poinst to sector %i (block offset in file %i) with block size %i. It fit completely in the file, but there is no space left after block in file (512 bytes for VHD footer). This can be because of file truncation or some strange error. Not counting this case as error, because BAT valid"%(e,block_start,block_start*512)
         elif block_start in block_list:
-            print "[BAD ] block %i is duplicate, pointing to %i"%(e,block_start)
+            print "[BAD ] entry %i is duplicate, pointing to %i"%(e,block_start)
             duplicate_count+=1;
         elif block_overlap(block_list,block_start,(4096+8)): #note, blocks are checking with sector_count, not bytes (no '*512')
-            print "[BAD ] block %i is overlapping with other region ponting to %i, overlapping with %i pointed by previos BAT entry"%(e,block_start,block_overlap(block_list,block_start,(4096+8)))
+            print "[BAD ] entry %i is overlapping with other region ponting to %i, overlapping with %i pointed by previos BAT entry"%(e,block_start,block_overlap(block_list,block_start,(4096+8))) #in citrix environment every block (except last) has 3854 bytes-padding at the end. They should not overlap with other blocks.
         else:
-            block_list.add(block_start);
-            debug("[good] block %i points to sector %i (offset=%i) with block size %i. It is within file borders."%(e,block_start,block_start*512,(4096+8)*512))
+            block_list.append(block_start);
+            debug("[good] entry %i points to sector %i (offset=%i) with block size %i. It is within file borders."%(e,block_start,block_start*512,(4096+1)*512))
     if beyond_count or duplicate_count or overlap_count or error_count:
             print "\nBlock Allocation Table (BAT) contains ERRORS!"
     else:
         verbose("\nBAT is fine")
-    verbose("Statistic:")
+    verbose("Statistic (BAT):")
     verbose("Total blocks:\t%i"%entries)
     verbose("Error read BAT:\t%i"%error_count)
     verbose("Empty blocks:\t%i"%empty_count)
@@ -115,14 +117,13 @@ def vhd_process(vhd,bat,mte,batsize,full,debug,verbose):
         entries=batsize
         debug("BAT size forced to %i, ignoring value in the VHD file.  Blocksize is 2MiB, payload is %i (%iMiB)"%(entries,entries*2*1024*1024,entries*2))
     if entries > 8388607: #(max_uint4/512-1)
-        print "MTE (%i) is larger than BAT can holds (%i): or MTE is wrong, or BAT contains duplicate entries, but will continue the check..."%(entries,8388607)
+        print "MTE (%i) is larger than BAT can holds (%i): Either MTE is wrong, or BAT contains duplicate entries. Will continue the check..."%(entries,8388607)
     if stat.st_size < bat:
         print "BAT is completely beyond file end (expected placement: %i, file size: %i). Nothing to do, exiting"%(bat,stat.st_size)
         return
     if stat.st_size < bat+entries*4: # 4 - size of each entry in BAT
         print "BAT is partially beyond file end (BAT offset is %i, BAT size is %i, file size %i), but will continue to validate leftovers."%(bat,entries*4,stat.st_size)
-    debug('Stage 1 validation: check all BAT entries are in file and not overlapping')
-    vhd_bat_validate(fd,stat,bat,entries,debug,verbose)
+    block_list=vhd_bat_validate(fd,stat,bat,entries,debug,verbose)
     os.close(fd)
     
 
@@ -131,7 +132,6 @@ def main():
     parser.add_argument("vhd_file", help="Path to VHD file, f.e. ~/d5f498d7-6e15-4c39-98d2-4d0c42cc6d3d.vhd")
     parser.add_argument("-v", "--verbosity", help="increase output verbosity", action="store_true")
     parser.add_argument("-d", "--debug", help="put junk on screen", action="store_true")
-    parser.add_argument("--full", help="perform full validation (even useless fields)", action="store_true") #not ipmlemented yet
     parser.add_argument("--bat", help="change default (0x600) BAT location, in hex", default="0x600")
     parser.add_argument("--mte", help="change default MTE field location, in hex", default="0x21C")
     parser.add_argument("--batsize", help="force  BAT size (override MTE filed in Dynamic Header), count in entries, hex", default='0')
@@ -139,7 +139,7 @@ def main():
     try:
         bat=int(args.bat,base=16)
     except:
-        print "Bad offset format (%s), expecting hex (0x600)\n"%(args.offset)
+        print "Bad offset format (%s), expecting hex (0x600)\n"%(args.bat)
         sys.exit(-1)
 
     try:
