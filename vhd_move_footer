@@ -1,0 +1,73 @@
+#!/usr/bin/python
+
+#    (c) Selectel, 2013
+#    by George Shuklin
+#
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+'''
+    Allow to move VHD footer within VHD file
+
+    Supports three cases:
+        * add new VHD footer (copy from header)
+        * enlarge VHD (and move VHD footer to new area)
+        * shrink VHD (and overwrite some data within VHD)
+'''
+import argparse
+import os,sys
+
+def validate_vhd_footer(footer):
+    pass #too lazy now
+
+def move_vhd_header(vhd,move,offset,keep,header,novalidate,trunc):
+    read_fd=os.open(vhd,os.O_RDONLY|os.O_NONBLOCK)
+    if not header:
+        os.lseek(read_fd,-512,os.SEEK_END)
+    header=os.read(read_fd,512)
+    if not novalidate:
+        validate_vhd_footer(header)
+    os.close(read_fd)
+    write_fd=os.open(vhd, os.O_WRONLY|os.O_NONBLOCK)
+    if not keep:
+        os.lseek(write_fd,-512,os.SEEK_END)
+        os.write(write_fd,512*'\x00') #whipe old header
+    if move=='rel':
+        os.lseek(write_fd,0,os.SEEK_END)
+    else:
+        os.lseek(write_fd,0,os.SEEK_SET)
+    os.lseek(write_fd,offset-512,os.SEEK_CUR)
+    os.write(write_fd,header)
+    if trunc:
+        new_pos=os.lseek(write_fd,0,os.SEEK_CUR)
+        os.ftruncate(write_fd,new_pos)
+    os.close(write_fd)
+        
+def main():
+    parser=argparse.ArgumentParser()
+    parser.add_argument("vhd_file", help="Path to VHD file, f.e. ~/d5f498d7-6e15-4c39-98d2-4d0c42cc6d3d.vhd")
+    parser.add_argument("move_type", help="Type of offset :absolute or relative to the file end", choices=['abs', 'rel'])
+    parser.add_argument("offset", help="offset in bytes (dec), can be negative for rel" ,type=int)
+    parser.add_argument("--keep",help="do not wipe old header placement", action="store_true")
+    parser.add_argument("--novalidate",help="do not validate footer (huh!)", action="store_true")
+    parser.add_argument("--header",help="take footer data from backup at the file start (but footer still will be wiped without --keep flag)",action="store_true")
+    parser.add_argument("--trunc", help="Truncate file at the end of new footer", action="store_true")
+    args = parser.parse_args()
+    if args.move_type=='abs' and args.offset<512:
+            print "Absolute offset can't be negative and can't be less than 512 bytes"
+            sys.exit(-1)
+    move_vhd_header(args.vhd_file,args.move_type,args.offset,args.keep,args.header,args.novalidate,args.trunc)
+
+if __name__ == "__main__":
+    main()
+
