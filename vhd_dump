@@ -1,0 +1,170 @@
+#!/usr/bin/python
+
+#    (c) Selectel, 2013
+#    by George Shuklin
+#
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+    
+'''
+    dump content (payload) of VHD file to stdout, skipping damaged parts.
+
+'''
+import os, sys, argparse,struct
+VERSION='1.0'
+
+class P():
+    def __init__(self,visible):
+        self.visible=visible
+
+    def __call__(self, message=""):
+        if self.visible:
+                sys.stderr.write(message+"\n")
+
+def dump_zeroes (size):
+    os.write(sys.stdout.fileno(), '\x00'*size)
+
+def unpack_bitmap(data):
+    output=list()
+    for i in struct.unpack("b"*len(data),data):
+        for b in xrange(0,8):
+            output.append(bool( i & (1 << b) ) )
+    return output
+
+def dump_block(fd,zero_pad,block_start,debug):
+    p=P(True)
+    debug=P(debug)
+    SIZE=2*1024*1024 #hardcoded
+    if block_start == 0xFFFFFFFF*512: #block is not in the file. We do not support VHD tree now, so assume it is empty
+        dump_zeroes(SIZE);
+        return
+    #reading bitmap
+    try:
+        os.lseek(fd,block_start,os.SEEK_SET)
+        bitmap_sector=os.read(fd,512)
+    except:
+        p("error reading block bitmap from offset %i"%block_start)
+        import traceback
+        traceback.print_exc()
+        if zero_pad:
+            bitmap_sector="\x00"*512
+        else:
+            sys.exit(-1)
+    bitmap=unpack_bitmap(bitmap_sector)
+    os.lseek(fd,block_start+512,os.SEEK_SET) #we can be in wrong place if bitmap reading failed
+    for sector in xrange(0,SIZE/512):
+        try:
+           if bitmap[sector]:
+               os.lseek(fd,block_start+512+sector*512, os.SEEK_SET)
+               sector=os.read(fd,512)
+           else:
+               sector='\x00'*512
+        except:
+           p("error reading sector from offset %i"%(block_start+512+sector*512))
+           import traceback
+           traceback.print_exc()
+           if zero_pad:
+                   sector='\x00'*512
+           else:
+                sys.exit(-1)
+        os.write(sys.stdout.fileno(),sector)
+                
+        
+
+
+def vhd_dump_blocks(fd,entries,bat,zero_pad,dataoffset,debug):
+    p=P(True)
+    for e in xrange(0,entries):
+        try:
+            os.lseek(fd,bat+e*4,os.SEEK_SET)
+            block_start=struct.unpack("!I",os.read(fd,4))[0]
+        except:
+            p("Error reading BAT entry %i (offset %i)"%(e,bat+e*4))
+            if zero_pad:
+                 block_start=0xFFFFFFFF #if zero_pad, assuming block is empty
+            else:
+                 sys.exit(-1)
+        dump_block(fd,zero_pad,block_start*512+dataoffset,debug)
+
+
+        
+
+def vhd_dump(vhd,bat,mte,batsize,zero_pad,dataoffset,debug):
+    debug=P(debug)
+    p=P(True)
+    stat=os.stat(vhd) 
+    fd=os.open(vhd,os.O_RDONLY|os.O_NONBLOCK)
+    if not batsize:
+        if stat.st_size<mte:
+                p("MTE (%i) is beyond file end (size=%i)"%(mte,stat.st_size))
+                return
+        debug("file %s opened as fd %i"%(vhd,fd))
+        os.lseek(fd,mte,os.SEEK_SET)
+        entries=struct.unpack("!I",os.read(fd,4))[0]
+        debug("Got MTE value from offset %x: %i"%(mte,entries))
+        debug("assuming block size to 2MiB, payload (disk size) is %i=%iMiB"%(entries*2*1024*1024, entries*2))
+    else:
+        entries=batsize
+        debug("BAT size forced to %i, ignoring value in the VHD file.  Blocksize is 2MiB, payload is %i (%iMiB)"%(entries,entries*2*1024*1024,entries*2))
+    if entries > 8388607: #(max_uint4/512-1)
+        p(" MTE (%i) is larger than BAT can holds (%i): Either MTE is wrong, or BAT contains duplicate entries. Will continue the check..."%(entries,8388607))
+    if stat.st_size < bat:
+        p("BAT is completely beyond file end (expected placement: %i, file size: %i). Nothing to do, exiting"%(bat,stat.st_size))
+        return
+    if stat.st_size < bat+entries*4: # 4 - size of each entry in BAT
+        p("BAT is partially beyond file end (BAT offset is %i, BAT size is %i, file size %i), but will continue to validate leftovers."%(bat,entries*4,stat.st_size))
+    vhd_dump_blocks(fd,entries,bat,zero_pad,dataoffset,debug)
+    os.close(fd)
+
+
+def main():
+    parser=argparse.ArgumentParser()
+    parser.add_argument("vhd_file", help="Path to VHD file, f.e. ~/d5f498d7-6e15-4c39-98d2-4d0c42cc6d3d.vhd")
+    parser.add_argument("-z", "--zero", help="Fill missing blocks with zeroes", action="store_true")
+    parser.add_argument("-d", "--debug", help="put junk on screen", action="store_true")
+    parser.add_argument("--bat", help="change default (0x600) BAT location, in hex", default="0x600")
+    parser.add_argument("--mte", help="change default MTE field location, in hex", default="0x21C")
+    parser.add_argument("--batsize", help="force  BAT size (override MTE filed in Dynamic Header), count in entries, hex", default='0x0')
+    parser.add_argument("--dataoffset",help="add offset to each BAT pointer (142%% guarantee wrong data), in hex",default="0x0")
+    parser.add_argument("--forcetty", help="force binary output on the tty (it's bad, do not use)",action="store_true")
+    args = parser.parse_args()
+    try:
+        bat=int(args.bat,base=16)
+    except:
+        sys.stderr.write("Bad offset format (%s), expecting hex (0x600)\n"%(args.bat))
+        sys.exit(-1)
+
+    try:
+        mte=int(args.mte,base=16)
+    except:
+        sys.stderr.write("Bat MTE format (%s), expecting hex (0x21C)\n"%(args.mte))
+        sys.exit(-1)
+    try:
+        batsize=int(args.batsize,base=16)
+    except:
+        sys.stderr.write("Bat batsize format (%s), expecting hex (f.e. 0x1FF)\n"%(args.batsize))
+        sys.exit(-1)
+    try:
+        dataoffset=int(args.dataoffset,base=16)
+    except:
+        sys.stderr.write("Bat batsize format (%s), expecting hex (f.e. 0x0)\n"%(args.dataoffset))
+        sys.exit(-1)
+    if sys.stdout.isatty() and not args.forcetty:
+        sys.stderr.write("Will not dump binary data on tty unless --forcetty. Use vhd_dump file.vhd >file.img\n")
+        sys.exit(-1)
+
+    vhd_dump(args.vhd_file, bat,mte,batsize,args.zero,dataoffset,args.debug)
+
+if __name__ == "__main__":
+    main()
+
